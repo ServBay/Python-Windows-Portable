@@ -1,0 +1,505 @@
+# .github/workflows/create_python_release_single.yml
+name: Create Portable Python Package
+
+on:
+  # 允许手动触发工作流
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: '要构建的 Python 版本 (例如 3.11.9)'
+        required: true
+        type: string
+      # is_prerelease:
+      #   description: '是否标记为预发布版本?'
+      #   type: boolean
+      #   default: false
+      # is_draft:
+      #   description: '是否创建为草稿?'
+      #   type: boolean
+      #   default: false
+
+# 为工作流设置权限
+permissions:
+  contents: write # 允许创建 Release 和上传 Assets
+  actions: read   # 允许读取 workflow run 相关信息 (如果需要用于 tag)
+
+jobs:
+  # 作业：为指定的 Python 版本创建便携 Zip 包
+  package:
+    # 指定运行环境为最新的 Windows
+    runs-on: windows-latest
+
+    steps:
+      # 步骤 1: 检出代码 (如果需要访问仓库中的脚本或文件)
+      # - uses: actions/checkout@v4
+
+      # 步骤 2: 确定安装包信息 (URL, 类型, 名称)
+      - name: Determine Installer Info for ${{ inputs.python_version }}
+        id: info
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.python_version }}"
+          $url = ""
+          $installerType = ""
+          $installerName = ""
+          $baseVersion = $version
+
+          # 检查是否为 Python 2.7
+          if ($version -eq '2.7.18') {
+            $installerType = "msi"
+            $installerName = "python-2.7.18.amd64.msi"
+            $url = "https://www.python.org/ftp/python/2.7.18/$installerName"
+          # 检查是否为预发布版本 (包含字母)
+          } elseif ($version -match '\d+\.\d+\.\d+[a-zA-Z]+\d*') {
+              $installerType = "exe"
+              $installerName = "python-${version}-amd64.exe"
+              # 尝试提取基础版本号 (例如 3.13.0 从 3.13.0a7) - 注意: Python 官网路径规则可能变化
+              $match = [regex]::Match($version, '^(\d+\.\d+\.\d+)')
+              if ($match.Success) { $baseVersion = $match.Groups[1].Value }
+              else { Write-Warning "Could not extract base version from pre-release $version, using full version for URL path." }
+              # 预发布版本的 URL 通常在其基础版本目录下
+              $url = "https://www.python.org/ftp/python/$baseVersion/$installerName"
+          # 否则认为是标准发布版本
+          } else {
+            $installerType = "exe"
+            $installerName = "python-${version}-amd64.exe"
+            $url = "https://www.python.org/ftp/python/$version/$installerName"
+          }
+
+          Write-Host "Version: $version"
+          Write-Host "Base Version for URL: $baseVersion"
+          Write-Host "Installer Type: $installerType"
+          Write-Host "Installer Name: $installerName"
+          Write-Host "URL: $url"
+
+          # 输出到 GitHub Actions 环境
+          echo "installer_url=$url" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          echo "installer_name=$installerName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          echo "installer_type=$installerType" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # 步骤 3: 下载 Python 安装包
+      - name: Download Python Installer (${{ inputs.python_version }})
+        id: download
+        shell: pwsh
+        run: |
+          $url = "${{ steps.info.outputs.installer_url }}"
+          $fileName = "${{ steps.info.outputs.installer_name }}"
+          $downloadPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath $fileName
+          Write-Host "Downloading $url to $downloadPath..."
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $downloadPath -ErrorAction Stop
+            Write-Host "Download complete."
+            # Output the download path for the uninstall step
+            echo "installer_path=$downloadPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } catch {
+            Write-Error "Failed to download installer from $url. Error: $_"
+            # 检查文件是否存在，如果部分下载则删除
+            if (Test-Path $downloadPath) { Remove-Item $downloadPath -Force }
+            exit 1
+          }
+
+      # 步骤 4: 尝试静默卸载已存在的 Python 版本
+      - name: Attempt Silent Uninstall of Existing Python (${{ inputs.python_version }})
+        # 依赖于 info 和 download 步骤
+        if: always() && steps.info.outputs.installer_name && steps.download.outputs.installer_path
+        shell: pwsh
+        run: |
+          $installerName = "${{ steps.info.outputs.installer_name }}"
+          $installerType = "${{ steps.info.outputs.installer_type }}"
+          $installerSourcePath = "${{ steps.download.outputs.installer_path }}"
+          $version = "${{ inputs.python_version }}"
+
+          # 定义卸载日志路径
+          $uninstallLogFile = "$env:GITHUB_WORKSPACE\uninstall_${version}.log"
+          $uninstallMsiLogFile = "$env:GITHUB_WORKSPACE\uninstall_${version}_msi.log"
+
+          Write-Host "Attempting silent uninstall of any existing Python $version using '$installerSourcePath'..."
+
+          # 检查下载的安装包是否存在
+          if (-not (Test-Path $installerSourcePath)) {
+              Write-Warning "Installer file '$installerSourcePath' not found (download might have failed). Skipping uninstall attempt."
+              # 不中止，继续执行后续步骤
+              exit 0
+          }
+
+          $arguments = ""
+          $process = $null
+          $exitCode = -1
+
+          try {
+              if ($installerType -eq "msi") {
+                  # MSI 卸载使用 /x 开关和 MSI 文件路径
+                  $arguments = "/x `"$installerSourcePath`" /qn /L*v `"$uninstallMsiLogFile`""
+                  Write-Host "Running: msiexec.exe $arguments"
+                  $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -NoNewWindow -PassThru -ErrorAction Stop
+              } elseif ($installerType -eq "exe") {
+                  # EXE 卸载使用 /uninstall 开关
+                  # 注意：某些旧版本可能不支持 /log 参数进行卸载
+                  $arguments = "/uninstall /quiet /log `"$uninstallLogFile`""
+                  Write-Host "Running: $installerSourcePath $arguments"
+                  $process = Start-Process -FilePath $installerSourcePath -ArgumentList $arguments -Wait -NoNewWindow -PassThru -ErrorAction Stop
+              } else {
+                  Write-Warning "Unknown installer type '$installerType'. Skipping uninstall attempt."
+                  # 不中止，继续执行后续步骤
+                  exit 0
+              }
+              $exitCode = $process.ExitCode
+
+              # 检查退出码
+              # 0: 成功
+              # 1605: ERROR_UNKNOWN_PRODUCT (MSI - 表示未安装，这是可接受的)
+              # 3010: ERROR_SUCCESS_REBOOT_REQUIRED (成功但需要重启，可接受)
+              # 其他: 警告
+              if ($exitCode -eq 0) {
+                  Write-Host "Silent uninstall command completed successfully (ExitCode: 0)."
+              } elseif ($exitCode -eq 1605) {
+                  Write-Host "Silent uninstall command indicated product not installed (ExitCode: $exitCode). This is expected if Python wasn't present."
+              } elseif ($exitCode -eq 3010) {
+                  Write-Host "Silent uninstall completed successfully, but may require a reboot (ExitCode: 3010). Continuing..."
+              } else {
+                  Write-Warning "Silent uninstall command finished with unexpected ExitCode: $exitCode. Attempting to proceed with installation anyway."
+                  # 尝试显示卸载日志（如果存在）
+                  if ($installerType -eq "exe" -and (Test-Path $uninstallLogFile)) {
+                      Write-Host "--- Uninstall Log ($uninstallLogFile) ---"
+                      Get-Content $uninstallLogFile -ErrorAction SilentlyContinue
+                      Write-Host "--- End Uninstall Log ---"
+                  } elseif ($installerType -eq "msi" -and (Test-Path $uninstallMsiLogFile)) {
+                      Write-Host "--- Uninstall Log ($uninstallMsiLogFile) ---"
+                      Get-Content $uninstallMsiLogFile -Encoding utf8 -Raw -ErrorAction SilentlyContinue
+                      Write-Host "--- End Uninstall Log ---"
+                  }
+              }
+
+          } catch {
+              # 捕获启动或等待进程时的错误
+              Write-Warning "Failed to execute or wait for the uninstall process: $_. Attempting to proceed with installation anyway."
+          }
+
+          Write-Host "Uninstall attempt finished. Proceeding to installation."
+          # 不在此处中止工作流 (exit 0 隐式执行)
+
+      # 步骤 5: 安装 Python (包含 RDP 回退和用户创建逻辑)
+      - name: Install Python (${{ inputs.python_version }}) with RDP Fallback
+        id: install
+        # 依赖于 info 和 download 步骤
+        if: always() && steps.info.outputs.installer_name && steps.download.outputs.installer_path
+        shell: pwsh
+        env:
+          # 从 Secrets 传入 ngrok Authtoken 和 RDP 密码
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $version = "${{ inputs.python_version }}"
+          $installerName = "${{ steps.info.outputs.installer_name }}"
+          $installerType = "${{ steps.info.outputs.installer_type }}"
+          $installerSourcePath = "${{ steps.download.outputs.installer_path }}"
+          $Architecture = "x64"
+          $ngrokLogFile = "$env:GITHUB_WORKSPACE\ngrok.log"
+          $ngrokProcess = $null
+          $rdpUser = "runneradmin"
+
+          # --- 定义安装路径 ---
+          $ToolcacheRoot = $env:RUNNER_TOOL_CACHE
+          if ([string]::IsNullOrEmpty($ToolcacheRoot)) { Write-Error "RUNNER_TOOL_CACHE not set."; exit 1 }
+          $PythonToolcachePath = Join-Path -Path $ToolcacheRoot -ChildPath "Python"
+          $PythonVersionPath = Join-Path -Path $PythonToolcachePath -ChildPath $version
+          $PythonArchPath = Join-Path -Path $PythonVersionPath -ChildPath $Architecture
+          $PythonExePath = Join-Path -Path $PythonArchPath -ChildPath "python.exe"
+
+          # --- 定义安装日志文件路径 ---
+          $installLogFile = "$env:GITHUB_WORKSPACE\install_${version}.log"
+          $installMsiLogFile = "$env:GITHUB_WORKSPACE\install_${version}_msi.log"
+
+          # --- 清理和创建目标目录 ---
+          # 注意：卸载步骤尝试清理系统安装，这里清理的是 Runner Tool Cache 中的目标目录
+          if (Test-Path $PythonArchPath) {
+              Write-Host "Removing existing target directory in ToolCache: $PythonArchPath"
+              Remove-Item -Path $PythonArchPath -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "Ensuring target directory exists: $PythonArchPath"
+          New-Item -ItemType Directory -Path $PythonArchPath -Force | Out-Null
+
+          # --- 检查安装包源文件 ---
+          if (-not (Test-Path $installerSourcePath)) {
+              Write-Error "Installer source file '$installerSourcePath' not found for installation. Download might have failed earlier."
+              exit 1
+          }
+
+          # --- 尝试静默安装 ---
+          Write-Host "Attempting silent installation of Python $version to $PythonArchPath..."
+          $arguments = ""
+          $process = $null
+          $exitCode = -1
+
+          try {
+              if ($installerType -eq "msi") {
+                  # MSI 安装使用 /i 开关
+                  $arguments = "/i `"$installerSourcePath`" /qn TARGETDIR=`"$PythonArchPath`" ALLUSERS=1 /L*v `"$installMsiLogFile`""
+                  Write-Host "Running: msiexec.exe $arguments"
+                  $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -NoNewWindow -PassThru -ErrorAction Stop
+              } elseif ($installerType -eq "exe") {
+                  # EXE 安装指定目标目录等参数
+                  $arguments = "DefaultAllUsersTargetDir=`"$PythonArchPath`" InstallAllUsers=1 /quiet /log `"$installLogFile`""
+                  Write-Host "Running: $installerSourcePath $arguments"
+                  $process = Start-Process -FilePath $installerSourcePath -ArgumentList $arguments -Wait -NoNewWindow -PassThru -ErrorAction Stop
+              } else {
+                  Write-Error "Unknown installer type: $installerType"; exit 1
+              }
+              $exitCode = $process.ExitCode
+          } catch {
+              Write-Warning "Failed to start or wait for installer process: $_"
+              $exitCode = -2
+          }
+
+          # --- 安装后验证 ---
+          $installationVerified = Test-Path $PythonExePath
+          Write-Host "Checking for python.exe at $PythonExePath... Found: $installationVerified"
+
+          # --- RDP 回退逻辑 ---
+          if (($exitCode -ne 0 -and $exitCode -ne 3010) -or (-not $installationVerified)) {
+              if ($exitCode -ne 3010) {
+                Write-Warning "Silent installation failed (ExitCode: $exitCode) or python.exe not found. Attempting RDP fallback."
+              } else {
+                Write-Host "Silent installation requires reboot (ExitCode: 3010), but python.exe was found. Treating as success for now."
+                # If python.exe IS found despite 3010, skip RDP fallback
+                if ($installationVerified) {
+                  Write-Host "Skipping RDP fallback as python.exe exists."
+                  # Jump to Pip installation logic needs restructuring, or just let it continue below
+                } else {
+                   Write-Warning "Silent installation requires reboot (ExitCode: 3010), AND python.exe was NOT found. Attempting RDP fallback."
+                   # Proceed with RDP fallback logic below
+                }
+              }
+
+
+              # Only proceed with RDP if *really* needed (failed or needs reboot *and* python.exe is missing)
+              if (($exitCode -ne 0 -and $exitCode -ne 3010) -or ($exitCode -eq 3010 -and -not $installationVerified)) {
+
+                  # 输出安装日志 (如果存在且安装失败)
+                  if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+                      Write-Host "Displaying installation logs (if available)..."
+                      if ($installerType -eq "exe" -and (Test-Path $installLogFile)) {
+                          Write-Host "--- Installer Log ($installLogFile) ---"
+                          Get-Content $installLogFile -ErrorAction SilentlyContinue
+                          Write-Host "--- End Installer Log ---"
+                      } elseif ($installerType -eq "msi" -and (Test-Path $installMsiLogFile)) {
+                          Write-Host "--- Installer Log ($installMsiLogFile) ---"
+                          Get-Content $installMsiLogFile -Encoding utf8 -Raw -ErrorAction SilentlyContinue
+                          Write-Host "--- End Installer Log ---"
+                      } else { Write-Warning "Installer log file not found or not applicable for this failure." }
+                  }
+
+                  # 检查 NGROK_AUTH_TOKEN 和 RDP_PASSWORD 是否设置
+                  if ([string]::IsNullOrEmpty($env:NGROK_AUTH_TOKEN)) {
+                      Write-Error "NGROK_AUTH_TOKEN secret is not set. Cannot start RDP session."
+                      exit 1
+                  }
+                  if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) {
+                      Write-Error "RDP_PASSWORD secret is not set. Cannot create RDP user."
+                      exit 1
+                  }
+
+                  # --- 创建 RDP 用户并设置密码 ---
+                  Write-Host "Creating RDP user '$rdpUser'..."
+                  try {
+                      Write-Host "Setting password for user '$rdpUser'..."
+                      $securePassword = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
+                      try { Get-LocalUser -Name $rdpUser | Set-LocalUser -Password $securePassword -ErrorAction Stop; Write-Host "Password set via Set-LocalUser."}
+                      catch { Write-Warning "Set-LocalUser failed: $($_.Exception.Message). Trying 'net user'..."; iex "net user $rdpUser '$($env:RDP_PASSWORD)'"; if ($LASTEXITCODE -ne 0) { throw "net user failed too."}; Write-Host "Password set via 'net user'." }
+                  } catch {
+                      Write-Error "Failed to create or configure RDP user '$rdpUser': $_"
+                      if (Get-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue }
+                      exit 1
+                  }
+
+                  Write-Host "Ensuring RDP is enabled..."
+                  try {
+                      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0 -Force -ErrorAction Stop
+                      Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop
+                      Write-Host "RDP enabled and firewall rule checked."
+                  } catch { Write-Warning "Failed to explicitly enable RDP or firewall rule: $_. Assuming it's already configured." }
+
+                  Write-Host "Setting up ngrok..."
+                  try { choco install ngrok -y --force --no-progress --ignore-checksums }
+                  catch {
+                      Write-Warning "Chocolatey install failed or choco not found. Attempting manual download..."
+                      $ngrokZip = "$env:TEMP\ngrok.zip"; $ngrokExe = "$env:TEMP\ngrok.exe"
+                      Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile $ngrokZip
+                      Expand-Archive $ngrokZip -DestinationPath $env:TEMP -Force
+                      Move-Item "$env:TEMP\ngrok.exe" $ngrokExe -Force
+                      Remove-Item $ngrokZip -Force
+                      $env:PATH += ";$env:TEMP"
+                  }
+                  if (-not (Get-Command ngrok -ErrorAction SilentlyContinue)) { Write-Error "ngrok command not found after installation attempts."; Remove-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue; exit 1 }
+                  Write-Host "Configuring ngrok authtoken..."
+                  ngrok config add-authtoken $env:NGROK_AUTH_TOKEN --log=stdout
+
+                  Write-Host "Starting ngrok RDP tunnel (TCP port 3389)..."
+                  $ngrokArgs = "tcp 3389 --log `"$ngrokLogFile`""
+                  try {
+                      $ngrokProcess = Start-Process ngrok -ArgumentList $ngrokArgs -WindowStyle Hidden -PassThru -ErrorAction Stop
+                      Write-Host "ngrok process started (PID: $($ngrokProcess.Id)). Waiting for tunnel info..."
+                      Start-Sleep -Seconds 15
+                      $rdpUrl = $null; $maxAttempts = 5; $attempt = 0
+                      while ($attempt -lt $maxAttempts -and -not $rdpUrl) {
+                          $attempt++; if (Test-Path $ngrokLogFile) { $logContent = Get-Content $ngrokLogFile -Raw -ErrorAction SilentlyContinue; $match = $logContent | Select-String -Pattern 'url=(tcp://[^ ]+)'; if ($match) { $rdpUrl = $match.Matches[0].Groups[1].Value; Write-Host "RDP Connection URL found: $rdpUrl"; break } }
+                          Write-Host "Waiting for ngrok URL in log... (Attempt $attempt/$maxAttempts)"; Start-Sleep -Seconds 5
+                      }
+                      if (-not $rdpUrl) { Write-Error "Failed to retrieve RDP connection URL from ngrok log ($ngrokLogFile) after $maxAttempts attempts."; if ($ngrokProcess) { Stop-Process -Id $ngrokProcess.Id -Force -ErrorAction SilentlyContinue }; Remove-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue; exit 1 }
+                      Write-Host "----------------------------------------------------------------------"
+                      Write-Host "ACTION REQUIRED: Manual installation needed via RDP."
+                      Write-Host "Connect using an RDP client to: $rdpUrl"
+                      Write-Host "Username: $rdpUser"
+                      Write-Host "Password: Use the value from your RDP_PASSWORD secret."
+                      Write-Host "The installer is located at: $installerSourcePath"
+                      Write-Host "Install Python to the target directory: $PythonArchPath"
+                      Write-Host "The workflow will wait for python.exe to appear in the target directory."
+                      Write-Host "Timeout: 30 minutes."
+                      Write-Host "----------------------------------------------------------------------"
+                  } catch { Write-Error "Failed to start ngrok process: $_"; if ($ngrokProcess) { Stop-Process -Id $ngrokProcess.Id -Force -ErrorAction SilentlyContinue }; Remove-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue; exit 1 }
+
+                  $timeoutMinutes = 30; $checkIntervalSeconds = 15; $startTime = Get-Date; $timedOut = $false
+                  Write-Host "Waiting for python.exe to appear at '$PythonExePath'..."
+                  while (-not (Test-Path $PythonExePath)) {
+                      $elapsedTime = (Get-Date) - $startTime; if ($elapsedTime.TotalMinutes -ge $timeoutMinutes) { $timedOut = $true; Write-Error "Timeout reached ($timeoutMinutes minutes). python.exe was not found."; break }
+                      Write-Host "($([int]$elapsedTime.TotalSeconds)s / $($timeoutMinutes * 60)s) Still waiting for python.exe..."; Start-Sleep -Seconds $checkIntervalSeconds
+                  }
+
+                  Write-Host "Stopping ngrok process..."; if ($ngrokProcess) { Stop-Process -Id $ngrokProcess.Id -Force -ErrorAction SilentlyContinue; Write-Host "ngrok process (PID: $($ngrokProcess.Id)) stopped." } else { Write-Warning "Could not find ngrok process object to stop it directly. Attempting taskkill."; taskkill /F /IM ngrok.exe /T | Out-Null }
+                  if ($timedOut) { if (Test-Path $PythonArchPath) { Remove-Item -Recurse -Force $PythonArchPath -ErrorAction SilentlyContinue }; Remove-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue; exit 1 }
+                  Write-Host "python.exe detected! Manual installation assumed complete."
+                  Write-Host "Waiting 3 minutes to ensure all processes finalize..."
+                  Start-Sleep -Seconds 180
+
+                  $installationVerified = Test-Path $PythonExePath
+                  if (-not $installationVerified) { Write-Error "VERIFICATION FAILED even after RDP intervention: python.exe not found at '$PythonExePath'."; if (Test-Path $PythonArchPath) { Remove-Item -Recurse -Force $PythonArchPath -ErrorAction SilentlyContinue }; Remove-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue; exit 1 }
+                  else { Write-Host "Verification successful after RDP intervention."; }
+              } # End of RDP fallback block
+
+          # --- 如果初始安装或 RDP 后验证成功 ---
+          } else {
+              if ($exitCode -eq 3010) {
+                 Write-Host "Initial installation completed successfully but requires reboot (ExitCode: 3010). python.exe found at '$PythonExePath'."
+              } else {
+                 Write-Host "Initial verification successful: python.exe found at '$PythonExePath'."
+              }
+          }
+
+          # --- Pip Installation/Upgrade ---
+          # 确保在此处安装 Pip，无论初始安装成功还是 RDP 后成功
+          Write-Host "Ensuring pip is installed/upgraded..."
+          if (Test-Path $PythonExePath) {
+              # 1. Run ensurepip first
+              Write-Host "Running ensurepip..."
+              $argumentsEnsure = "-m ensurepip"
+              $processEnsure = $null
+              try {
+                  # Execute ensurepip using Start-Process
+                  $processEnsure = Start-Process -FilePath $PythonExePath -ArgumentList $argumentsEnsure -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                  if ($processEnsure.ExitCode -ne 0) {
+                      # Throw an error if ensurepip fails
+                      throw "ensurepip failed with exit code $($processEnsure.ExitCode)."
+                  }
+                  Write-Host "ensurepip completed successfully."
+
+                  # 2. Run pip install/upgrade only if ensurepip succeeded
+                  Write-Host "Upgrading pip..."
+                  $argumentsUpgrade = "-m pip install --upgrade --force-reinstall pip --no-warn-script-location"
+                  $processUpgrade = $null
+                  # Execute pip upgrade using Start-Process
+                  $processUpgrade = Start-Process -FilePath $PythonExePath -ArgumentList $argumentsUpgrade -Wait -NoNewWindow -PassThru -ErrorAction Stop
+                  if ($processUpgrade.ExitCode -ne 0) {
+                      # Throw an error if pip upgrade fails
+                      throw "pip upgrade failed with exit code $($processUpgrade.ExitCode)."
+                  }
+                  Write-Host "Pip upgraded successfully."
+
+              } catch {
+                  # Catch errors from either Start-Process call or non-zero exit codes
+                  Write-Warning "Pip installation/upgrade command failed: $_"
+                  # Decide if this failure should stop the workflow
+                  # exit 1 # Uncomment this line if a pip failure should be fatal
+              }
+          } else {
+              Write-Error "Cannot proceed with pip installation because Python executable '$PythonExePath' was not found after all attempts."
+              exit 1
+          }
+
+          # 输出安装目录路径，供后续打包步骤使用
+          echo "install_dir=$PythonArchPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # 步骤 6: 打包已安装的 Python 目录
+      - name: Package Installed Python (${{ inputs.python_version }})
+        id: package
+        if: success() && steps.install.outputs.install_dir
+        shell: pwsh
+        run: |
+          $installDir = "${{ steps.install.outputs.install_dir }}"
+          $zipFileName = "python-${{ inputs.python_version }}-win-x64.zip"
+          $destinationPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath $zipFileName
+
+          if (-not (Test-Path $installDir)) { Write-Error "Installation directory not found at '$installDir'. Cannot package."; exit 1 }
+          Write-Host "Listing contents of installation directory '$installDir' before packaging:"
+          Get-ChildItem -Path $installDir -Recurse -Depth 1 | Out-String
+          $itemCount = (Get-ChildItem -Path $installDir).Count
+          if ($itemCount -eq 0) { Write-Error "Installation directory '$installDir' is empty. Cannot package."; exit 1 }
+          Write-Host "Compressing installed Python from '$installDir' to '$destinationPath'..."
+          $parentDir = Split-Path $installDir -Parent; $dirName = Split-Path $installDir -Leaf
+          Push-Location $parentDir
+          try { Compress-Archive -Path $dirName -DestinationPath $destinationPath -Force -ErrorAction Stop }
+          catch { Write-Error "Failed to compress archive: $_"; Pop-Location; exit 1 }
+          Pop-Location
+          if (-not (Test-Path $destinationPath)) { Write-Error "Failed to create zip file at '$destinationPath'."; exit 1 }
+          Write-Host "Packaging complete: $destinationPath"
+          echo "zip_name=$zipFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          echo "zip_path=$destinationPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # 步骤 7: 创建 Release 并上传 Asset (为当前版本)
+      - name: Create Release and Upload Asset for ${{ inputs.python_version }}
+        uses: softprops/action-gh-release@v2
+        if: success() && steps.package.outputs.zip_path
+        with:
+          tag_name: python-${{ inputs.python_version }}-win-x64
+          name: Portable Python ${{ inputs.python_version }} for Windows x64
+          body: |
+            Python ${{ inputs.python_version }} for Windows x64 Portable (ServBay).
+          draft: false # ${{ inputs.is_draft || false }}
+          prerelease: ${{ contains(inputs.python_version, 'a') || contains(inputs.python_version, 'b') || contains(inputs.python_version, 'rc') }}
+          files: ${{ steps.package.outputs.zip_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 步骤 8: 清理安装（删除 ToolCache、安装包、日志）
+      - name: Clean up Installation (${{ inputs.python_version }})
+        if: always()
+        shell: pwsh
+        run: |
+          $installDir = "${{ steps.install.outputs.install_dir }}"
+          $installerSourcePath = "${{ steps.download.outputs.installer_path }}"
+          $zipPath = "${{ steps.package.outputs.zip_path }}"
+
+          if ($installDir -and (Test-Path $installDir)) {
+            Write-Host "Removing installed directory from ToolCache: $installDir"
+            Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "Install directory path not found or directory doesn't exist, skipping removal."
+          }
+
+          if ($installerSourcePath -and (Test-Path $installerSourcePath)) {
+            Write-Host "Removing downloaded installer file: $installerSourcePath"
+            Remove-Item -Force $installerSourcePath -ErrorAction SilentlyContinue
+          }
+
+          if ($zipPath -and (Test-Path $zipPath)) {
+              Write-Host "Removing packaged zip file: $zipPath"
+              Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Removing installation, uninstallation and ngrok log files (if any)..."
+          Remove-Item -Path "$env:GITHUB_WORKSPACE\install_*.log" -ErrorAction SilentlyContinue
+          Remove-Item -Path "$env:GITHUB_WORKSPACE\install_*_msi.log" -ErrorAction SilentlyContinue
+          Remove-Item -Path "$env:GITHUB_WORKSPACE\uninstall_*.log" -ErrorAction SilentlyContinue
+          Remove-Item -Path "$env:GITHUB_WORKSPACE\uninstall_*_msi.log" -ErrorAction SilentlyContinue
+          Remove-Item -Path "$env:GITHUB_WORKSPACE\ngrok.log" -ErrorAction SilentlyContinue
+
+          Write-Host "Cleanup finished."
